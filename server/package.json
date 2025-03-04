@@ -1,0 +1,13 @@
+{
+  "name": "poker-server",
+  "version": "1.0.0",
+  "description": "WebSocket server for multiplayer poker game",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.1"
+  }
+} 
