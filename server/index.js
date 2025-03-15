@@ -36,7 +36,7 @@ function createGame(gameId) {
   return {
     id: gameId,
     players: [],
-    deck: [],
+    deck: createDeck(),
     communityCards: [],
     pot: 0,
     currentBet: 0,
@@ -47,6 +47,45 @@ function createGame(gameId) {
     bigBlind: 10,
     lastRaisePlayerId: null
   };
+}
+
+// Create a new deck of 52 cards
+function createDeck() {
+  const suits = ['hearts', 'diamonds', 'clubs', 'spades'];
+  const ranks = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
+  const deck = [];
+  
+  for (const suit of suits) {
+    for (const rank of ranks) {
+      deck.push({ suit, rank });
+    }
+  }
+  
+  return shuffleDeck(deck);
+}
+
+// Shuffle a deck of cards using the Fisher-Yates algorithm
+function shuffleDeck(deck) {
+  const shuffled = [...deck];
+  
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  
+  return shuffled;
+}
+
+// Deal cards from the deck
+function dealCards(deck, count) {
+  if (count > deck.length) {
+    throw new Error(`Cannot deal ${count} cards from a deck of ${deck.length} cards`);
+  }
+  
+  const cards = deck.slice(0, count);
+  const remainingDeck = deck.slice(count);
+  
+  return { cards, remainingDeck };
 }
 
 // Socket.IO connection handler
@@ -196,6 +235,9 @@ io.on('connection', (socket) => {
       return;
     }
     
+    // Reset the deck for a new game
+    game.deck = createDeck();
+    
     // Initialize the game
     game.phase = 'dealing';
     game.dealerIndex = 0;
@@ -205,6 +247,11 @@ io.on('connection', (socket) => {
     game.players.forEach((player, index) => {
       player.isDealer = index === game.dealerIndex;
       player.isCurrentTurn = index === game.currentPlayerIndex;
+      
+      // Deal 2 hole cards to each player
+      const { cards, remainingDeck } = dealCards(game.deck, 2);
+      player.cards = cards;
+      game.deck = remainingDeck;
       
       // Small blind (player after dealer)
       if (index === (game.dealerIndex + 1) % game.players.length) {
@@ -223,13 +270,12 @@ io.on('connection', (socket) => {
       }
     });
     
-    // Deal cards to players (this would be handled by the client in our implementation)
     game.phase = 'betting';
     
     // Notify all players that the game has started
     io.to(gameId).emit('gameStarted', { game });
     
-    console.log(`Game ${gameId} started`);
+    console.log(`Game ${gameId} started with ${game.players.length} players`);
   });
   
   // Player actions: check, call, raise, fold
@@ -404,19 +450,47 @@ function advanceToNextPhase(game) {
   game.currentBet = 0;
   game.lastRaisePlayerId = null;
   
+  // Deal community cards based on the phase
   switch (game.phase) {
     case 'betting':
       game.phase = 'flop';
+      // Deal 3 cards for the flop
+      if (game.communityCards.length === 0) {
+        const { cards, remainingDeck } = dealCards(game.deck, 3);
+        game.communityCards = cards;
+        game.deck = remainingDeck;
+        console.log('Dealt flop:', game.communityCards);
+      }
       break;
     case 'flop':
       game.phase = 'turn';
+      // Deal 1 card for the turn
+      if (game.communityCards.length === 3) {
+        const { cards, remainingDeck } = dealCards(game.deck, 1);
+        game.communityCards = [...game.communityCards, ...cards];
+        game.deck = remainingDeck;
+        console.log('Dealt turn:', game.communityCards);
+      }
       break;
     case 'turn':
       game.phase = 'river';
+      // Deal 1 card for the river
+      if (game.communityCards.length === 4) {
+        const { cards, remainingDeck } = dealCards(game.deck, 1);
+        game.communityCards = [...game.communityCards, ...cards];
+        game.deck = remainingDeck;
+        console.log('Dealt river:', game.communityCards);
+      }
       break;
     case 'river':
       game.phase = 'showdown';
       // Ensure all 5 community cards are available for determining the winner
+      if (game.communityCards.length < 5) {
+        const cardsNeeded = 5 - game.communityCards.length;
+        const { cards, remainingDeck } = dealCards(game.deck, cardsNeeded);
+        game.communityCards = [...game.communityCards, ...cards];
+        game.deck = remainingDeck;
+      }
       determineWinner(game);
       break;
     case 'showdown':
@@ -737,6 +811,9 @@ function resetGame(game) {
   game.currentBet = 0;
   game.lastRaisePlayerId = null;
   
+  // Create a new shuffled deck
+  game.deck = createDeck();
+  
   // Move the dealer button to the next player
   game.dealerIndex = (game.dealerIndex + 1) % game.players.length;
   
@@ -747,6 +824,8 @@ function resetGame(game) {
     player.folded = false;
     player.isCurrentTurn = false;
     player.isDealer = false;
+    player.isWinner = false;
+    player.handDescription = null;
   });
   
   // Set the new dealer
@@ -762,8 +841,12 @@ function resetGame(game) {
       game.phase = 'dealing';
       game.currentPlayerIndex = (game.dealerIndex + 3) % game.players.length; // Start with player after big blind
       
-      // Set dealer, small blind, and big blind
+      // Deal 2 hole cards to each player
       game.players.forEach((player, index) => {
+        const { cards, remainingDeck } = dealCards(game.deck, 2);
+        player.cards = cards;
+        game.deck = remainingDeck;
+        
         player.isDealer = index === game.dealerIndex;
         player.isCurrentTurn = index === game.currentPlayerIndex;
         

@@ -2,7 +2,6 @@
 
 import { create } from 'zustand';
 import { socketService, Game, Player, ErrorEvent } from '../lib/socket';
-import { createDeck, shuffleDeck, dealCards } from '../lib/deck';
 
 // Define the game interface
 interface MultiplayerGameState {
@@ -177,115 +176,46 @@ export const useMultiplayerGameStore = create<MultiplayerGameState>((set, get) =
             });
         });
 
-        // We're now using gameUpdated instead of playerJoined
         socket.on('gameUpdated', ({ game }) => {
             console.log('Game updated event received with players:', game.players.length);
-            const { localPlayer, game: currentGame } = get();
+            const { localPlayer } = get();
 
             // Preserve the current player's reference
             const updatedLocalPlayer = game.players.find((p: Player) => p.id === localPlayer?.id) || null;
 
-            // Preserve cards that were already dealt
-            if (currentGame) {
-                // Preserve community cards
-                if (currentGame.communityCards.length > 0) {
-                    game.communityCards = currentGame.communityCards;
-                }
+            // Never modify the server-sent game state, just use it as is
+            // This ensures all players see the same community cards and player positions
+            set({
+                game,
+                localPlayer: updatedLocalPlayer || localPlayer
+            });
+        });
 
-                // Preserve player cards
-                if (currentGame.players.length > 0) {
-                    game.players = game.players.map((player: Player) => {
-                        const existingPlayer = currentGame.players.find(p => p.id === player.id);
-                        if (existingPlayer && existingPlayer.cards.length > 0) {
-                            return {
-                                ...player,
-                                cards: existingPlayer.cards
-                            };
-                        }
-                        return player;
-                    });
-                }
-            }
+        socket.on('gameStarted', ({ game }) => {
+            console.log('Game started event received with players:', game.players.length);
+            const { localPlayer } = get();
 
-            // Check if we need to deal cards based on phase changes
-            const needToUpdatePhase = currentGame && game.phase !== currentGame.phase;
+            // Preserve the current player's reference
+            const updatedLocalPlayer = game.players.find((p: Player) => p.id === localPlayer?.id) || null;
+
+            // Never modify the server-sent game state
+            set({
+                game,
+                localPlayer: updatedLocalPlayer || localPlayer
+            });
+        });
+
+        socket.on('playerDisconnected', ({ playerId, game }) => {
+            console.log('Player disconnected event received:', playerId);
+            const { localPlayer } = get();
+
+            // Preserve the current player's reference
+            const updatedLocalPlayer = game.players.find((p: Player) => p.id === localPlayer?.id) || null;
 
             set({
                 game,
                 localPlayer: updatedLocalPlayer || localPlayer
             });
-
-            // Deal community cards if the phase changed and we need new cards
-            if (needToUpdatePhase &&
-                game.communityCards.length === 0 &&
-                game.phase !== 'waiting' &&
-                game.phase !== 'betting') {
-                console.log('Phase changed, dealing new community cards for phase:', game.phase);
-                setTimeout(() => get().dealCards(), 100);
-            }
-        });
-
-        socket.on('gameStarted', ({ game }) => {
-            console.log('Game started event received with players:', game.players.length);
-            const currentGame = get().game;
-
-            // Preserve any existing cards
-            if (currentGame) {
-                if (currentGame.communityCards.length > 0) {
-                    game.communityCards = currentGame.communityCards;
-                }
-
-                if (currentGame.players.length > 0) {
-                    game.players = game.players.map((player: Player) => {
-                        const existingPlayer = currentGame.players.find(p => p.id === player.id);
-                        if (existingPlayer && existingPlayer.cards.length > 0) {
-                            return {
-                                ...player,
-                                cards: existingPlayer.cards
-                            };
-                        }
-                        return player;
-                    });
-                }
-            }
-
-            set({ game });
-
-            // Deal cards only when game starts and players don't have cards yet
-            const needToInitialDeal = game.players.some((p: Player) => p.cards.length === 0);
-            if (needToInitialDeal) {
-                console.log('Initial deal needed, dealing cards to players');
-                setTimeout(() => get().dealCards(), 100);
-            }
-        });
-
-        socket.on('playerDisconnected', ({ playerId, game }) => {
-            console.log('Player disconnected event received:', playerId);
-            const currentGame = get().game;
-
-            // Preserve cards if they exist
-            if (currentGame) {
-                // Preserve community cards
-                if (currentGame.communityCards.length > 0) {
-                    game.communityCards = currentGame.communityCards;
-                }
-
-                // Preserve player cards
-                if (currentGame.players.length > 0) {
-                    game.players = game.players.map((player: Player) => {
-                        const existingPlayer = currentGame.players.find(p => p.id === player.id);
-                        if (existingPlayer && existingPlayer.cards.length > 0) {
-                            return {
-                                ...player,
-                                cards: existingPlayer.cards
-                            };
-                        }
-                        return player;
-                    });
-                }
-            }
-
-            set({ game });
         });
 
         socket.on('error', ({ message }: ErrorEvent) => {
@@ -297,94 +227,6 @@ export const useMultiplayerGameStore = create<MultiplayerGameState>((set, get) =
 
     // Card dealing (client-side for demo)
     dealCards: () => {
-        const { game, localPlayer } = get();
-
-        if (!game || !localPlayer) return;
-
-        // Create and shuffle a deck
-        const deck = shuffleDeck(createDeck());
-
-        // Deal 2 cards to each player if they don't already have cards
-        const updatedPlayers = [...game.players];
-        let remainingDeck = [...deck];
-
-        for (let i = 0; i < updatedPlayers.length; i++) {
-            // Only deal cards to players who don't have them
-            if (updatedPlayers[i].cards.length === 0) {
-                const { cards, remainingDeck: newDeck } = dealCards(remainingDeck, 2);
-                updatedPlayers[i].cards = cards;
-                remainingDeck = newDeck;
-            }
-        }
-
-        // Deal community cards based on the game phase only if they're not already dealt
-        let communityCards = [...game.communityCards];
-
-        // Only deal new community cards if we don't have any yet or if we need to ensure 5 cards for showdown
-        if (communityCards.length === 0 || (game.phase === 'showdown' && communityCards.length < 5)) {
-            console.log(`Dealing community cards for phase: ${game.phase}`);
-
-            switch (game.phase) {
-                case 'flop':
-                    // Deal 3 cards for the flop
-                    communityCards = dealCards(remainingDeck, 3).cards;
-                    break;
-                case 'turn':
-                    // Deal 4 cards total (3 for flop + 1 for turn)
-                    if (communityCards.length < 3) {
-                        // If we don't have flop cards yet, deal them first
-                        communityCards = dealCards(remainingDeck, 3).cards;
-                        remainingDeck = remainingDeck.slice(3);
-                    }
-                    // Add the turn card
-                    if (communityCards.length === 3) {
-                        communityCards = [...communityCards, ...dealCards(remainingDeck, 1).cards];
-                    }
-                    break;
-                case 'river':
-                    // Deal 5 cards total (3 for flop + 1 for turn + 1 for river)
-                    if (communityCards.length < 3) {
-                        // If we don't have flop cards yet, deal them first
-                        communityCards = dealCards(remainingDeck, 3).cards;
-                        remainingDeck = remainingDeck.slice(3);
-                    }
-                    // Add the turn card if needed
-                    if (communityCards.length === 3) {
-                        communityCards = [...communityCards, ...dealCards(remainingDeck, 1).cards];
-                        remainingDeck = remainingDeck.slice(1);
-                    }
-                    // Add the river card
-                    if (communityCards.length === 4) {
-                        communityCards = [...communityCards, ...dealCards(remainingDeck, 1).cards];
-                    }
-                    break;
-                case 'showdown':
-                    // Always ensure we have all 5 cards for showdown
-                    if (communityCards.length < 5) {
-                        const cardsNeeded = 5 - communityCards.length;
-                        communityCards = [...communityCards, ...dealCards(remainingDeck, cardsNeeded).cards];
-                    }
-                    break;
-                default:
-                    break;
-            }
-        }
-
-        // Update the game state with the dealt cards
-        const updatedGame = {
-            ...game,
-            players: updatedPlayers,
-            communityCards
-        };
-
-        // Update the local player reference
-        const updatedLocalPlayer = updatedPlayers.find(p => p.id === localPlayer.id) || null;
-
-        set({
-            game: updatedGame,
-            localPlayer: updatedLocalPlayer
-        });
-
-        console.log(`Cards dealt: ${updatedPlayers.length} players have cards, ${communityCards.length} community cards`);
+        console.log('Client no longer deals cards - using server-provided cards');
     }
 })); 

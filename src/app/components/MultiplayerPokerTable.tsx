@@ -5,6 +5,7 @@ import { Card } from './Card';
 import { cn } from '../lib/utils';
 import { useMultiplayerGameStore } from '../store/multiplayerGameStore';
 import { GameModal } from './GameModal';
+import { Player } from '../lib/socket';
 
 export const MultiplayerPokerTable: React.FC = () => {
   const [showWinnerAnimation, setShowWinnerAnimation] = useState(false);
@@ -209,29 +210,25 @@ export const MultiplayerPokerTable: React.FC = () => {
   }
 
   // Calculate positions for players around the table
-  const getPlayerPosition = (index: number, totalPlayers: number) => {
-    // For up to 8 players, position them around the table
-    // We'll use a full ellipse for positioning
+  const getPlayerPosition = (player: Player) => {
+    // Fix positions for 8 player slots around the table like in the reference image
+    // Each player is assigned to a designated seat (0-7) based on their position property
 
-    // Start at the bottom and go clockwise
-    // Local player is always at the bottom (position 0)
-    // We need to distribute other players evenly
+    // Define the 8 fixed position slots around the table
+    const fixedPositions = [
+      { left: 50, top: 85 }, // Bottom (position 0)
+      { left: 25, top: 75 }, // Bottom left (position 1)
+      { left: 10, top: 50 }, // Left (position 2)
+      { left: 25, top: 25 }, // Top left (position 3)
+      { left: 50, top: 15 }, // Top (position 4)
+      { left: 75, top: 25 }, // Top right (position 5)
+      { left: 90, top: 50 }, // Right (position 6)
+      { left: 75, top: 75 }, // Bottom right (position 7)
+    ];
 
-    // Calculate angle based on position (in radians)
-    // For 8 players, we want angles at: 0, 45, 90, 135, 180, 225, 270, 315 degrees
-    const angleOffset = -90; // Start at bottom (270 degrees or -90 degrees)
-    const angle =
-      (index * (360 / totalPlayers) + angleOffset) * (Math.PI / 180);
-
-    // Table is elliptical, not circular
-    const horizontalRadius = 42; // % from center
-    const verticalRadius = 35; // % from center (slightly smaller to account for the oval table)
-
-    // Calculate position (center of table is 50%, 50%)
-    const left = 50 + horizontalRadius * Math.cos(angle);
-    const top = 50 + verticalRadius * Math.sin(angle);
-
-    return { left, top };
+    // Use the player's fixed position from their server-assigned position property
+    // This ensures consistent positioning across all clients
+    return fixedPositions[player.position % 8];
   };
 
   // Find the current player's turn
@@ -336,18 +333,39 @@ export const MultiplayerPokerTable: React.FC = () => {
             </div>
           )}
 
-          {/* All players around the table (including local player) */}
-          {game.players.map((player, index) => {
+          {/* All 8 positions around the table (empty or filled) */}
+          {Array.from({ length: 8 }, (_, position) => {
+            // Find player at this position, if any
+            const player = game.players.find((p) => p.position === position);
+            const isEmpty = !player;
+
+            // Get position coordinates
+            const { left, top } = getPlayerPosition({ position } as Player);
+
+            // If no player in this position, render an empty seat
+            if (isEmpty) {
+              return (
+                <div
+                  key={`empty-${position}`}
+                  className='absolute w-40 p-2 rounded-md bg-gray-800 bg-opacity-30 text-white transform -translate-x-1/2 -translate-y-1/2'
+                  style={{
+                    left: `${left}%`,
+                    top: `${top}%`,
+                    height: '80px', // Fixed height for empty seats
+                  }}
+                >
+                  <div className='flex justify-center items-center h-full'>
+                    <span className='text-xs text-gray-400'>
+                      Seat {position + 1}
+                    </span>
+                  </div>
+                </div>
+              );
+            }
+
+            // Otherwise render the player
             const isLocalPlayer = player.id === localPlayer.id;
             const isWinner = isShowdown && winner?.id === player.id;
-
-            // Calculate position - we'll position all players around the table
-            // Local player is always at the bottom
-            const playerIndex = isLocalPlayer ? 0 : index;
-            const { left, top } = getPlayerPosition(
-              playerIndex,
-              Math.max(game.players.length, 2)
-            );
 
             return (
               <div
