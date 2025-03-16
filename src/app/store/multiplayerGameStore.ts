@@ -1,7 +1,7 @@
 'use client';
 
 import { create } from 'zustand';
-import { socketService, Game, Player, ErrorEvent } from '../lib/socket';
+import { socketService, Game, Player, ErrorEvent, GameSettings } from '../lib/socket';
 
 // Define the game interface
 interface MultiplayerGameState {
@@ -13,10 +13,19 @@ interface MultiplayerGameState {
     isConnected: boolean;
     isLoading: boolean;
 
+    // User settings
+    userSettings: {
+        funds: number;
+        theme: 'dark' | 'light' | 'classic';
+        fontSize: 'small' | 'medium' | 'large';
+        notifications: boolean;
+    };
+
     // UI state
     raiseAmount: number;
     showJoinGameModal: boolean;
     showCreateGameModal: boolean;
+    showUserSettingsModal: boolean;
     playerName: string;
     gameIdToJoin: string;
 
@@ -27,13 +36,19 @@ interface MultiplayerGameState {
     closeCreateGameModal: () => void;
     openJoinGameModal: () => void;
     closeJoinGameModal: () => void;
-    createGame: () => void;
+    openUserSettingsModal: () => void;
+    closeUserSettingsModal: () => void;
+    createGame: (gameType?: string, settings?: Partial<GameSettings>) => void;
     joinGame: () => void;
     startGame: () => void;
     leaveGame: () => void;
     performAction: (action: 'check' | 'call' | 'raise' | 'fold') => void;
     setRaiseAmount: (amount: number) => void;
     nextPhase: () => void;
+
+    // User settings actions
+    addFunds: (amount: number) => void;
+    updateUserSettings: (settings: Partial<MultiplayerGameState['userSettings']>) => void;
 
     // Socket event handlers
     handleSocketEvents: () => void;
@@ -52,10 +67,31 @@ export const useMultiplayerGameStore = create<MultiplayerGameState>((set, get) =
     isConnected: false,
     isLoading: false,
 
+    // User settings - load from localStorage if available
+    userSettings: (() => {
+        if (typeof window !== 'undefined') {
+            const storedSettings = localStorage.getItem('userSettings');
+            if (storedSettings) {
+                try {
+                    return JSON.parse(storedSettings);
+                } catch (error) {
+                    console.error('Error parsing user settings:', error);
+                }
+            }
+        }
+        return {
+            funds: 5000, // Default starting funds
+            theme: 'dark' as const,
+            fontSize: 'medium' as const,
+            notifications: true
+        };
+    })(),
+
     // UI state
     raiseAmount: 20, // Default raise amount
     showJoinGameModal: false,
     showCreateGameModal: false,
+    showUserSettingsModal: false,
     playerName: '',
     gameIdToJoin: '',
 
@@ -72,17 +108,28 @@ export const useMultiplayerGameStore = create<MultiplayerGameState>((set, get) =
 
     closeJoinGameModal: () => set({ showJoinGameModal: false }),
 
-    createGame: () => {
-        const { playerName } = get();
-        console.log('Creating game in store with player name:', playerName);
+    openUserSettingsModal: () => set({ showUserSettingsModal: true }),
+
+    closeUserSettingsModal: () => set({ showUserSettingsModal: false }),
+
+    createGame: (gameType = 'texas', settings = {}) => {
+        const { playerName, userSettings } = get();
+        console.log('Creating game in store with player name:', playerName, 'and game type:', gameType);
 
         if (!playerName.trim()) {
             set({ error: 'Please enter a player name' });
             return;
         }
 
+        // Set initial buyIn from user funds if not specified
+        const gameSettings = {
+            ...settings,
+            gameType,
+            buyIn: settings.buyIn || Math.min(1000, userSettings.funds) // Default or capped by available funds
+        };
+
         set({ isLoading: true, error: null });
-        socketService.createGame(playerName);
+        socketService.createGame(playerName, gameSettings);
     },
 
     joinGame: () => {
@@ -133,6 +180,32 @@ export const useMultiplayerGameStore = create<MultiplayerGameState>((set, get) =
         socketService.nextPhase();
     },
 
+    // User settings actions
+    addFunds: (amount) => {
+        if (amount <= 0) return;
+
+        set(state => {
+            const updatedFunds = state.userSettings.funds + amount;
+            const updatedSettings = { ...state.userSettings, funds: updatedFunds };
+
+            // Save to localStorage
+            localStorage.setItem('userSettings', JSON.stringify(updatedSettings));
+
+            return { userSettings: updatedSettings };
+        });
+    },
+
+    updateUserSettings: (settings) => {
+        set(state => {
+            const updatedSettings = { ...state.userSettings, ...settings };
+
+            // Save to localStorage
+            localStorage.setItem('userSettings', JSON.stringify(updatedSettings));
+
+            return { userSettings: updatedSettings };
+        });
+    },
+
     // Socket event handlers
     handleSocketEvents: () => {
         const socket = socketService.connect();
@@ -178,47 +251,63 @@ export const useMultiplayerGameStore = create<MultiplayerGameState>((set, get) =
 
         socket.on('gameUpdated', ({ game }) => {
             console.log('Game updated event received with players:', game.players.length);
-            const { localPlayer } = get();
 
-            // Preserve the current player's reference
-            const updatedLocalPlayer = game.players.find((p: Player) => p.id === localPlayer?.id) || null;
+            // Find the local player in the updated game state
+            const localPlayerId = get().localPlayer?.id;
+            const updatedLocalPlayer = localPlayerId
+                ? game.players.find((p: Player) => p.id === localPlayerId)
+                : null;
 
-            // Never modify the server-sent game state, just use it as is
-            // This ensures all players see the same community cards and player positions
             set({
                 game,
-                localPlayer: updatedLocalPlayer || localPlayer
+                localPlayer: updatedLocalPlayer,
+                isLoading: false
+            });
+        });
+
+        // Add a handler for spectator updates
+        socket.on('spectatorUpdate', ({ game, gameId }) => {
+            console.log('Spectator update received for game:', gameId, 'with players:', game.players.length);
+            set({
+                game,
+                gameId,
+                isLoading: false
             });
         });
 
         socket.on('gameStarted', ({ game }) => {
             console.log('Game started event received with players:', game.players.length);
-            const { localPlayer } = get();
 
-            // Preserve the current player's reference
-            const updatedLocalPlayer = game.players.find((p: Player) => p.id === localPlayer?.id) || null;
+            // Find the local player in the updated game state
+            const localPlayerId = get().localPlayer?.id;
+            const updatedLocalPlayer = localPlayerId
+                ? game.players.find((p: Player) => p.id === localPlayerId)
+                : null;
 
-            // Never modify the server-sent game state
             set({
                 game,
-                localPlayer: updatedLocalPlayer || localPlayer
+                localPlayer: updatedLocalPlayer,
+                isLoading: false
             });
         });
 
         socket.on('playerDisconnected', ({ playerId, game }) => {
-            console.log('Player disconnected event received:', playerId);
-            const { localPlayer } = get();
+            console.log('Player disconnected event received:', playerId, 'with players:', game.players.length);
 
-            // Preserve the current player's reference
-            const updatedLocalPlayer = game.players.find((p: Player) => p.id === localPlayer?.id) || null;
+            // Find the local player in the updated game state
+            const localPlayerId = get().localPlayer?.id;
+            const updatedLocalPlayer = localPlayerId
+                ? game.players.find((p: Player) => p.id === localPlayerId)
+                : null;
 
             set({
                 game,
-                localPlayer: updatedLocalPlayer || localPlayer
+                localPlayer: updatedLocalPlayer
             });
         });
 
         socket.on('error', ({ message }: ErrorEvent) => {
+            console.error('Socket error received:', message);
             set({ error: message, isLoading: false });
         });
     },

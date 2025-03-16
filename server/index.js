@@ -15,6 +15,31 @@ const games = new Map();
 // Store player connections
 const players = new Map();
 
+// Default game settings
+const defaultGameSettings = {
+  texas: {
+    smallBlind: 5,
+    bigBlind: 10,
+    buyIn: 1000,
+    maxPlayers: 8,
+    holeCards: 2 // Number of hole cards per player
+  },
+  omaha: {
+    smallBlind: 10,
+    bigBlind: 20,
+    buyIn: 1000,
+    maxPlayers: 6,
+    holeCards: 4 // Omaha uses 4 hole cards
+  },
+  'seven-card-stud': {
+    smallBlind: 5,
+    bigBlind: 10,
+    buyIn: 1000,
+    maxPlayers: 8,
+    holeCards: 0 // Special handling for seven-card stud
+  }
+};
+
 // Generate a random game ID
 function generateGameId() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -32,7 +57,13 @@ function generatePlayerName() {
 }
 
 // Create a new game
-function createGame(gameId) {
+function createGame(gameId, gameType = 'texas', customSettings = {}) {
+  // Get settings based on game type, with fallback to texas
+  const typeSettings = defaultGameSettings[gameType] || defaultGameSettings.texas;
+  
+  // Merge default and custom settings
+  const settings = { ...typeSettings, ...customSettings };
+  
   return {
     id: gameId,
     players: [],
@@ -43,8 +74,12 @@ function createGame(gameId) {
     phase: 'waiting', // waiting, dealing, betting, flop, turn, river, showdown
     currentPlayerIndex: 0,
     dealerIndex: 0,
-    smallBlind: 5,
-    bigBlind: 10,
+    gameType: gameType, // 'texas', 'omaha', 'seven-card-stud'
+    smallBlind: settings.smallBlind,
+    bigBlind: settings.bigBlind,
+    buyIn: settings.buyIn,
+    maxPlayers: settings.maxPlayers,
+    holeCards: settings.holeCards,
     lastRaisePlayerId: null
   };
 }
@@ -86,6 +121,43 @@ function dealCards(deck, count) {
   const remainingDeck = deck.slice(count);
   
   return { cards, remainingDeck };
+}
+
+// Format game data for sending to clients
+function formatGameForClient(game) {
+  if (!game) return null;
+  
+  // Create a copy of the game object to avoid modifying the original
+  const gameCopy = { ...game };
+  
+  // Remove the deck from the client-side representation for security
+  delete gameCopy.deck;
+  
+  // For each player, only show their own cards
+  if (gameCopy.players) {
+    gameCopy.players = gameCopy.players.map(player => {
+      // Create a copy of the player object
+      const playerCopy = { ...player };
+      
+      // Keep the cards visible for the specific player when sending to them
+      // Other players' cards will be hidden from clients until showdown
+      if (game.phase !== 'showdown') {
+        playerCopy.cards = playerCopy.cards.map(card => {
+          // Hide card details from other players
+          return { 
+            suit: 'hidden', 
+            rank: 'hidden',
+            // Keep original card ID if present
+            id: card.id
+          };
+        });
+      }
+      
+      return playerCopy;
+    });
+  }
+  
+  return gameCopy;
 }
 
 // Socket.IO connection handler
@@ -136,15 +208,17 @@ io.on('connection', (socket) => {
   });
   
   // Create a new game
-  socket.on('createGame', ({ playerName }) => {
-    console.log(`Creating game for player ${playerName}`);
-    const gameId = generateGameId();
-    const game = createGame(gameId);
+  socket.on('createGame', ({ playerName, gameType = 'texas', settings = {} }) => {
+    console.log(`Creating ${gameType} game for player ${playerName}`);
+    
+    // Use provided game ID or generate a new one
+    const gameId = settings.gameId || generateGameId();
+    const game = createGame(gameId, gameType, settings);
     
     const player = {
       id: socket.id,
       name: playerName || generatePlayerName(),
-      chips: 1000,
+      chips: game.buyIn,
       cards: [],
       bet: 0,
       folded: false,
@@ -163,7 +237,7 @@ io.on('connection', (socket) => {
     // Send the complete game state to the creator
     socket.emit('gameCreated', { gameId, player, game });
     
-    console.log(`Game created: ${gameId} by player ${player.name}`);
+    console.log(`Game created: ${gameId} (${gameType}) by player ${player.name}`);
   });
   
   // Join an existing game
@@ -180,7 +254,7 @@ io.on('connection', (socket) => {
       return;
     }
     
-    if (game.players.length >= 8) { // Increase max players to 8
+    if (game.players.length >= game.maxPlayers) {
       socket.emit('error', { message: 'Game is full' });
       return;
     }
@@ -191,7 +265,7 @@ io.on('connection', (socket) => {
     const player = {
       id: socket.id,
       name: playerName || generatePlayerName(),
-      chips: 1000,
+      chips: game.buyIn,
       cards: [],
       bet: 0,
       folded: false,
@@ -212,7 +286,7 @@ io.on('connection', (socket) => {
     // Then, notify all players in the game (including the one who just joined) about the updated game state
     io.to(gameId).emit('gameUpdated', { game });
     
-    console.log(`Player ${player.name} joined game ${gameId}`);
+    console.log(`Player ${player.name} joined game ${gameId} (${game.gameType})`);
   });
   
   // Start the game
@@ -248,10 +322,19 @@ io.on('connection', (socket) => {
       player.isDealer = index === game.dealerIndex;
       player.isCurrentTurn = index === game.currentPlayerIndex;
       
-      // Deal 2 hole cards to each player
-      const { cards, remainingDeck } = dealCards(game.deck, 2);
-      player.cards = cards;
-      game.deck = remainingDeck;
+      // Deal hole cards based on game type
+      if (game.gameType === 'texas' || game.gameType === 'omaha') {
+        const holeCardCount = game.gameType === 'texas' ? 2 : 4;
+        const { cards, remainingDeck } = dealCards(game.deck, holeCardCount);
+        player.cards = cards;
+        game.deck = remainingDeck;
+      } else if (game.gameType === 'seven-card-stud') {
+        // In seven-card stud, initially deal 3 cards (2 face-down, 1 face-up)
+        const { cards, remainingDeck } = dealCards(game.deck, 3);
+        player.cards = cards;
+        player.visibleCards = [cards[2]]; // Third card is face-up
+        game.deck = remainingDeck;
+      }
       
       // Small blind (player after dealer)
       if (index === (game.dealerIndex + 1) % game.players.length) {
@@ -275,7 +358,7 @@ io.on('connection', (socket) => {
     // Notify all players that the game has started
     io.to(gameId).emit('gameStarted', { game });
     
-    console.log(`Game ${gameId} started with ${game.players.length} players`);
+    console.log(`Game ${gameId} (${game.gameType}) started with ${game.players.length} players`);
   });
   
   // Player actions: check, call, raise, fold
@@ -421,6 +504,101 @@ io.on('connection', (socket) => {
     }
     
     console.log(`Player disconnected: ${socket.id}`);
+  });
+
+  // Check if a player already exists in a game
+  socket.on('checkExistingPlayer', ({ gameId, playerName }) => {
+    const game = games.get(gameId);
+    
+    if (!game) {
+      socket.emit('playerExists', false);
+      return;
+    }
+    
+    // Check if a player with this name already exists in the game
+    const existingPlayer = game.players.find(p => p.name === playerName);
+    socket.emit('playerExists', !!existingPlayer);
+  });
+  
+  // Reconnect an existing player
+  socket.on('reconnectPlayer', ({ gameId, playerName }) => {
+    const game = games.get(gameId);
+    
+    if (!game) {
+      socket.emit('error', { message: 'Game not found' });
+      return;
+    }
+    
+    // Find the existing player
+    const existingPlayer = game.players.find(p => p.name === playerName);
+    
+    if (!existingPlayer) {
+      socket.emit('error', { message: 'Player not found' });
+      return;
+    }
+    
+    // Update the player's socket
+    existingPlayer.socketId = socket.id;
+    existingPlayer.isConnected = true;
+    
+    // Add socket to the game room
+    socket.join(gameId);
+    
+    // Send game joined event with existing player data
+    socket.emit('gameJoined', { 
+      gameId, 
+      player: existingPlayer,
+      game: formatGameForClient(game)
+    });
+    
+    // Notify other players
+    socket.to(gameId).emit('playerReconnected', { 
+      playerId: existingPlayer.id,
+      game: formatGameForClient(game)
+    });
+    
+    console.log(`Player ${playerName} reconnected to game ${gameId}`);
+  });
+
+  // Add a new socket event handler for joining as a spectator
+  socket.on('joinAsSpectator', ({ gameId }) => {
+    let game = games.get(gameId);
+    
+    // For predefined game IDs (like texas-holdem-1), create the game if it doesn't exist
+    if (!game && gameId.includes('-')) {
+      console.log(`Game ${gameId} not found for spectator. Creating it automatically...`);
+      
+      // Extract game type from the ID format (e.g., "texas-holdem-1" -> "texas")
+      const gameTypeMatch = gameId.match(/^([^-]+)/);
+      const gameType = gameTypeMatch ? gameTypeMatch[1] : 'texas';
+      
+      // Create a new game with this ID
+      game = createGame(gameId, gameType);
+      
+      // Store in the games map
+      games.set(gameId, game);
+      console.log(`Created predefined game ${gameId} of type ${gameType} for spectator`);
+    }
+    
+    if (!game) {
+      socket.emit('error', { message: 'Game not found' });
+      return;
+    }
+    
+    // Add socket to the game room
+    socket.join(gameId);
+    
+    // Create a spectator ID but don't add them to the game's players
+    const spectatorId = `spectator_${socket.id}`;
+    
+    // Send the current game state to the spectator
+    socket.emit('spectatorUpdate', { 
+      gameId,
+      game: formatGameForClient(game)
+    });
+    
+    // Log the spectator joining
+    console.log(`Spectator ${spectatorId} joined game ${gameId}`);
   });
 });
 

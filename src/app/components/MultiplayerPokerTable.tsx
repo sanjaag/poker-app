@@ -1,19 +1,137 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { Card } from './Card';
 import { cn } from '../lib/utils';
 import { useMultiplayerGameStore } from '../store/multiplayerGameStore';
-import { GameModal } from './GameModal';
-import { Player } from '../lib/socket';
+import Link from 'next/link';
+import { socketService } from '../lib/socket';
+import { UserSettingsModal, AddFundsPrompt } from './UserSettings';
 
-export const MultiplayerPokerTable: React.FC = () => {
+interface MultiplayerPokerTableProps {
+  roomId?: string;
+  playerName?: string;
+  gameType?: string;
+  isSpectator?: boolean;
+  selectedSeat?: number | null;
+  onSeatSelect?: (position: number) => void;
+}
+
+// Update GameModal component to accept needed props
+interface CustomGameModalProps {
+  title: string;
+  onClose: () => void;
+  onSubmit: (data: {
+    gameId?: string;
+    gameType?: string;
+    smallBlind?: string;
+    bigBlind?: string;
+    buyIn?: string;
+    maxPlayers?: string;
+  }) => void;
+  gameIdToJoin?: string;
+  showGameIdField?: boolean;
+  isOpen: boolean;
+  playerName?: string;
+  error?: string;
+}
+
+// Wrapper for CustomGameModal that handles conditional rendering to fix useState hook warning
+const ModalWrapper: React.FC<CustomGameModalProps> = (props) => {
+  if (!props.isOpen) return null;
+  return <CustomGameModalContent {...props} />;
+};
+
+// Content component for the modal that always renders its hooks
+const CustomGameModalContent: React.FC<CustomGameModalProps> = ({
+  title,
+  onClose,
+  onSubmit,
+  gameIdToJoin,
+  showGameIdField,
+}) => {
+  const [formData, setFormData] = useState({
+    gameId: gameIdToJoin || '',
+    gameType: 'texas',
+    smallBlind: '5',
+    bigBlind: '10',
+    buyIn: '1000',
+    maxPlayers: '8',
+  });
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    onSubmit(formData);
+  };
+
+  return (
+    <div className='fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50'>
+      <div className='bg-gray-800 p-6 rounded-lg max-w-md w-full'>
+        <h2 className='text-xl font-bold text-white mb-4'>{title}</h2>
+        <form onSubmit={handleSubmit}>
+          {showGameIdField && (
+            <div className='mb-4'>
+              <label className='block text-gray-300 mb-2'>Game ID</label>
+              <input
+                type='text'
+                value={formData.gameId}
+                onChange={(e) =>
+                  setFormData({ ...formData, gameId: e.target.value })
+                }
+                className='w-full p-2 bg-gray-700 border border-gray-600 rounded text-white'
+              />
+            </div>
+          )}
+          <div className='flex justify-end mt-4 space-x-3'>
+            <button
+              type='button'
+              onClick={onClose}
+              className='px-4 py-2 bg-gray-600 text-white rounded'
+            >
+              Cancel
+            </button>
+            <button
+              type='submit'
+              className='px-4 py-2 bg-blue-600 text-white rounded'
+            >
+              Submit
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+// Export the wrapper component as CustomGameModal
+const CustomGameModal = ModalWrapper;
+
+export const MultiplayerPokerTable: React.FC<MultiplayerPokerTableProps> = ({
+  roomId,
+  playerName,
+  gameType = 'texas',
+  isSpectator = false,
+  selectedSeat,
+  onSeatSelect,
+}) => {
   const [showWinnerAnimation, setShowWinnerAnimation] = useState(false);
   const [winner, setWinner] = useState<{
     id: string;
     name: string;
     handDescription: string;
   } | null>(null);
+  const [showUserSettings, setShowUserSettings] = useState(false);
+  const [showAddFundsPrompt, setShowAddFundsPrompt] = useState(false);
+  const [requiredFunds, setRequiredFunds] = useState(0);
+  const [showCreateGameModal, setShowCreateGameModal] = useState(false);
+  const [showJoinGameModal, setShowJoinGameModal] = useState(false);
+  const [gameIdToJoin, setGameIdToJoin] = useState(''); // Renamed from localGameIdToJoin
+  const [debugMessage, setDebugMessage] = useState<string | null>(null);
+
+  // Track if we've already attempted to join
+  const hasJoinedRef = useRef(false);
+  // Track if socket events are already set up
+  const socketEventsSetUpRef = useRef(false);
 
   const {
     game,
@@ -22,16 +140,9 @@ export const MultiplayerPokerTable: React.FC = () => {
     error,
     isConnected,
     isLoading,
-    showJoinGameModal,
-    showCreateGameModal,
-    playerName,
-    gameIdToJoin,
-    setPlayerName,
-    setGameIdToJoin,
-    openCreateGameModal,
-    closeCreateGameModal,
-    openJoinGameModal,
-    closeJoinGameModal,
+    userSettings,
+    setPlayerName: setStorePlayerName,
+    setGameIdToJoin: setStoreGameIdToJoin,
     createGame,
     joinGame,
     startGame,
@@ -40,7 +151,6 @@ export const MultiplayerPokerTable: React.FC = () => {
     setRaiseAmount,
     handleSocketEvents,
     clearError,
-    dealCards,
   } = useMultiplayerGameStore();
 
   console.log('MultiplayerPokerTable rendered', {
@@ -51,52 +161,186 @@ export const MultiplayerPokerTable: React.FC = () => {
     localPlayer: localPlayer ? 'exists' : 'null',
     players: game?.players?.length || 0,
     playerIds: game?.players?.map((p) => p.id) || [],
+    isSpectator,
   });
 
-  // Initialize socket connection and event handlers
-  useEffect(() => {
-    console.log('Setting up socket connection');
-    handleSocketEvents();
+  // Custom wrapper for performAction that handles raise amount
+  const handleAction = useCallback(
+    (action: 'check' | 'call' | 'raise' | 'fold', amount?: number) => {
+      if (action === 'raise' && amount) {
+        setRaiseAmount(amount);
+      }
+      performAction(action);
+    },
+    [setRaiseAmount, performAction]
+  );
 
-    // Force deal cards for testing if needed
-    if (game && game.phase !== 'waiting' && game.communityCards.length === 0) {
-      dealCards();
+  // Use the player name from props if provided
+  useEffect(() => {
+    if (playerName) {
+      setStorePlayerName(playerName);
+    }
+  }, [playerName, setStorePlayerName]);
+
+  // If a roomId is provided, automatically join that game - but only once
+  useEffect(() => {
+    const joinRoom = async () => {
+      // Only proceed if we haven't joined yet
+      if (roomId && !hasJoinedRef.current) {
+        setDebugMessage(
+          `Attempting to join room: ${roomId}, isSpectator: ${isSpectator}`
+        );
+        hasJoinedRef.current = true; // Mark that we've attempted to join
+
+        try {
+          if (isSpectator) {
+            // Handle spectator mode
+            console.log(`Joining ${roomId} as spectator`);
+
+            // Ensure socket is connected
+            socketService.connect();
+
+            // Set up the game ID for the store to track
+            setStoreGameIdToJoin(roomId);
+
+            // Join as spectator using the dedicated method
+            socketService.joinAsSpectator(roomId);
+
+            // Force update game state after a short delay
+            setTimeout(() => {
+              handleSocketEvents();
+            }, 500);
+          } else if (playerName) {
+            // Regular player joining
+            console.log(
+              `Attempting to join room: ${roomId} as player ${playerName}`
+            );
+
+            // Check if this is a predefined room ID
+            const isPredefinedRoom = roomId.includes('-');
+
+            if (isPredefinedRoom) {
+              // For predefined rooms like texas-holdem-1, create a game with this ID if it doesn't exist
+              const gameTypeMatch = roomId.match(/^([^-]+)/);
+              const derivedGameType = gameTypeMatch
+                ? gameTypeMatch[1]
+                : 'texas';
+
+              // Get settings from localStorage if available
+              let settings: Partial<{
+                smallBlind: number;
+                bigBlind: number;
+                buyIn: number;
+                maxPlayers: number;
+                gameId: string;
+              }> = {};
+
+              try {
+                const storedSettings = localStorage.getItem('gameSettings');
+                settings = storedSettings ? JSON.parse(storedSettings) : {};
+              } catch (e) {
+                console.error('Error parsing stored settings:', e);
+              }
+
+              // Create a game with the specified room ID
+              console.log(
+                `Creating game for predefined room: ${roomId} with type: ${derivedGameType}`
+              );
+              createGame(derivedGameType, { ...settings, gameId: roomId });
+
+              // Wait a short time then attempt to join
+              setTimeout(() => {
+                console.log(`Now joining room: ${roomId}`);
+                setStoreGameIdToJoin(roomId);
+                joinGame();
+              }, 500);
+            } else {
+              // Regular room ID - just try to join
+              setStoreGameIdToJoin(roomId);
+              joinGame();
+            }
+          } else {
+            // No player name but attempting to join - must be a spectator
+            console.log(
+              `No player name provided, joining ${roomId} as spectator`
+            );
+            socketService.connect();
+            socketService.joinAsSpectator(roomId);
+
+            // Force update game state after a short delay
+            setTimeout(() => {
+              handleSocketEvents();
+            }, 500);
+          }
+        } catch (error) {
+          console.error('Error joining room:', error);
+          setDebugMessage(`Error joining room: ${error}`);
+          // Reset the join flag to allow another attempt
+          hasJoinedRef.current = false;
+        }
+      }
+    };
+
+    joinRoom();
+
+    // Reset the join flag if component unmounts or if we receive a new roomId
+    return () => {
+      hasJoinedRef.current = false;
+    };
+  }, [
+    roomId,
+    playerName,
+    setStoreGameIdToJoin,
+    joinGame,
+    createGame,
+    isSpectator,
+    handleSocketEvents,
+  ]);
+
+  // Handle socket events - but only set up once
+  useEffect(() => {
+    if (!socketEventsSetUpRef.current) {
+      console.log('Setting up socket events');
+      handleSocketEvents();
+      socketEventsSetUpRef.current = true;
     }
 
+    // Clean up socket connection when component unmounts
     return () => {
       console.log('Cleaning up socket connection');
-      leaveGame();
+      if (!isSpectator) {
+        // Don't leave the game if in spectator mode
+        leaveGame();
+      }
+      socketEventsSetUpRef.current = false;
     };
-  }, [handleSocketEvents, leaveGame]);
+  }, [handleSocketEvents, leaveGame, isSpectator]);
 
-  // Show winner animation when game enters showdown phase
+  // Pass game type to server when creating or joining a game
+  useEffect(() => {
+    // This would be used when implementing different game variations
+    if (gameType && game) {
+      console.log(`Game type: ${gameType}`);
+      // In a real implementation, we would use this to configure game rules
+    }
+  }, [gameType, game]);
+
+  // Set up winner animation when a player wins
   useEffect(() => {
     if (game?.phase === 'showdown') {
-      // Find the winner (player with most chips gained in this round)
-      const activePlayers = game.players.filter((p) => !p.folded);
-
-      if (activePlayers.length > 0) {
-        // Get the winner from the game state
-        // The server should have determined the winner based on hand strength
-        const winningPlayer =
-          game.players.find(
-            (p) =>
-              p.isWinner || // If server marked a winner
-              (activePlayers.length === 1 && p.id === activePlayers[0].id) // Or if only one player remains
-          ) || activePlayers[0]; // Fallback to first active player
-
+      const winningPlayer = game.players.find((p) => p.isWinner);
+      if (winningPlayer) {
         setWinner({
           id: winningPlayer.id,
           name: winningPlayer.name,
           handDescription: winningPlayer.handDescription || 'Winning Hand',
         });
-
         setShowWinnerAnimation(true);
 
-        // Hide the animation after 5 seconds
+        // Hide the animation after 3 seconds
         const timer = setTimeout(() => {
           setShowWinnerAnimation(false);
-        }, 5000);
+        }, 3000);
 
         return () => clearTimeout(timer);
       }
@@ -122,548 +366,543 @@ export const MultiplayerPokerTable: React.FC = () => {
     }
   }, [game, gameId, localPlayer]);
 
-  // If not connected to a game, show the lobby
-  if (!game || !localPlayer) {
+  // Handle seat selection
+  useEffect(() => {
+    if (
+      selectedSeat !== undefined &&
+      selectedSeat !== null &&
+      playerName &&
+      !isSpectator
+    ) {
+      // Handle the logic to actually take the seat
+      console.log(`Taking seat ${selectedSeat} as ${playerName}`);
+
+      // TODO: Implement actual seat selection logic with the server
+      // For now, we'll just join the game
+      if (!hasJoinedRef.current) {
+        hasJoinedRef.current = true;
+        setStoreGameIdToJoin(roomId || '');
+        joinGame();
+      }
+    }
+  }, [
+    selectedSeat,
+    playerName,
+    isSpectator,
+    joinGame,
+    roomId,
+    setStoreGameIdToJoin,
+  ]);
+
+  // Handler for checking funds before joining or creating a game
+  const checkFundsForGame = useCallback(
+    (requiredAmount: number) => {
+      if (userSettings.funds < requiredAmount) {
+        setRequiredFunds(requiredAmount);
+        setShowAddFundsPrompt(true);
+        return false;
+      }
+      return true;
+    },
+    [userSettings.funds]
+  );
+
+  // If we don't have a game loaded and no roomId was provided, show the welcome screen
+  if (!game && !roomId) {
     return (
-      <div className='min-h-screen bg-green-900 flex flex-col items-center justify-center p-4'>
-        <div className='bg-white dark:bg-gray-800 rounded-lg shadow-lg p-8 max-w-md w-full'>
-          <h1 className='text-3xl font-bold mb-6 text-center'>Poker Game</h1>
+      <div className='min-h-screen flex items-center justify-center bg-green-900 p-4'>
+        <div className='max-w-md w-full bg-white rounded-lg shadow-lg overflow-hidden'>
+          <div className='bg-green-800 p-6'>
+            <h2 className='text-2xl font-bold text-white text-center'>
+              Multiplayer Poker
+            </h2>
 
-          <div className='space-y-4'>
-            <button
-              onClick={() => {
-                console.log('Create game button clicked');
-                openCreateGameModal();
-              }}
-              className='w-full py-3 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors'
-            >
-              Create New Game
-            </button>
-
-            <button
-              onClick={() => {
-                console.log('Join game button clicked');
-                openJoinGameModal();
-              }}
-              className='w-full py-3 bg-green-600 text-white rounded-md hover:bg-green-700 transition-colors'
-            >
-              Join Game
-            </button>
+            <div className='mt-3 flex justify-end'>
+              <div className='flex space-x-2'>
+                <button
+                  onClick={() => setShowUserSettings(true)}
+                  className='px-2 py-1 bg-blue-600 text-white text-xs rounded hover:bg-blue-700'
+                >
+                  Settings
+                </button>
+                <Link
+                  href='/management/poker-control-panel'
+                  className='px-2 py-1 bg-gray-600 text-white text-xs rounded hover:bg-gray-700'
+                >
+                  Admin
+                </Link>
+              </div>
+            </div>
           </div>
 
-          {error && (
-            <div className='mt-4 p-3 bg-red-100 border border-red-400 text-red-700 rounded'>
-              {error}
+          <div className='p-6 space-y-6'>
+            <div className='text-center'>
+              <div className='text-lg font-semibold'>Your Funds</div>
+              <div className='text-2xl font-bold text-green-600'>
+                ${userSettings.funds.toLocaleString()}
+              </div>
+            </div>
+
+            <p className='text-gray-700 text-center'>
+              Welcome to Multiplayer Poker! Create a new game or join an
+              existing one.
+            </p>
+
+            <div className='space-y-4'>
               <button
-                onClick={clearError}
-                className='ml-2 text-red-700 font-bold'
+                onClick={() => {
+                  if (checkFundsForGame(1000)) {
+                    setShowCreateGameModal(true);
+                  }
+                }}
+                className='w-full py-3 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors'
               >
-                ×
+                Create New Game
+              </button>
+
+              <button
+                onClick={() => {
+                  if (checkFundsForGame(1000)) {
+                    setShowJoinGameModal(true);
+                  }
+                }}
+                className='w-full py-3 bg-green-600 text-white rounded-md hover:bg-green-700 transition-colors'
+              >
+                Join Game
               </button>
             </div>
-          )}
 
-          <div className='mt-6 text-center text-sm text-gray-500 dark:text-gray-400'>
-            {isConnected ? (
-              <span className='text-green-500'>Connected to server</span>
-            ) : (
-              <span className='text-red-500'>Disconnected from server</span>
+            {error && (
+              <div className='mt-4 p-3 bg-red-100 border border-red-400 text-red-700 rounded'>
+                {error}
+                <button
+                  onClick={clearError}
+                  className='ml-2 text-red-700 font-bold'
+                >
+                  ×
+                </button>
+              </div>
             )}
+
+            <div className='mt-6 text-center text-sm text-gray-500 dark:text-gray-400'>
+              {isConnected ? (
+                <span className='text-green-500'>Connected to server</span>
+              ) : (
+                <span className='text-red-500'>Disconnected from server</span>
+              )}
+            </div>
           </div>
+
+          {/* Create Game Modal */}
+          <CustomGameModal
+            isOpen={showCreateGameModal}
+            onClose={() => setShowCreateGameModal(false)}
+            title='Create New Game'
+            onSubmit={(data) => {
+              console.log('Create game modal submit', data);
+              createGame(data.gameType || 'texas', {
+                smallBlind: parseInt(data.smallBlind || '5'),
+                bigBlind: parseInt(data.bigBlind || '10'),
+                buyIn: parseInt(data.buyIn || '1000'),
+                maxPlayers: parseInt(data.maxPlayers || '8'),
+              });
+              setShowCreateGameModal(false);
+            }}
+          />
+
+          {/* Join Game Modal */}
+          <CustomGameModal
+            isOpen={showJoinGameModal}
+            onClose={() => setShowJoinGameModal(false)}
+            title='Join Game'
+            gameIdToJoin={gameIdToJoin}
+            showGameIdField={true}
+            onSubmit={(data) => {
+              console.log('Join game modal submit', data);
+              if (data.gameId) {
+                setGameIdToJoin(data.gameId);
+                setStoreGameIdToJoin(data.gameId);
+                joinGame();
+              }
+              setShowJoinGameModal(false);
+            }}
+          />
+
+          {/* User Settings Modal */}
+          <UserSettingsModal
+            isOpen={showUserSettings}
+            onClose={() => setShowUserSettings(false)}
+          />
+
+          {/* Add Funds Prompt */}
+          <AddFundsPrompt
+            isOpen={showAddFundsPrompt}
+            onClose={() => setShowAddFundsPrompt(false)}
+            requiredAmount={requiredFunds}
+          />
         </div>
-
-        {/* Create Game Modal */}
-        <GameModal
-          isOpen={showCreateGameModal}
-          onClose={closeCreateGameModal}
-          title='Create New Game'
-          playerName={playerName}
-          onPlayerNameChange={setPlayerName}
-          onSubmit={() => {
-            console.log('Create game modal submit');
-            createGame();
-          }}
-          error={error}
-          isLoading={isLoading}
-          submitLabel='Create Game'
-        />
-
-        {/* Join Game Modal */}
-        <GameModal
-          isOpen={showJoinGameModal}
-          onClose={closeJoinGameModal}
-          title='Join Game'
-          playerName={playerName}
-          onPlayerNameChange={setPlayerName}
-          gameId={gameIdToJoin}
-          onGameIdChange={setGameIdToJoin}
-          onSubmit={() => {
-            console.log('Join game modal submit');
-            joinGame();
-          }}
-          error={error}
-          isLoading={isLoading}
-          submitLabel='Join Game'
-        />
       </div>
     );
   }
 
-  // Calculate positions for players around the table
-  const getPlayerPosition = (player: Player) => {
-    // Fix positions for 8 player slots around the table like in the reference image
-    // Each player is assigned to a designated seat (0-7) based on their position property
-
-    // Define the 8 fixed position slots around the table
-    const fixedPositions = [
-      { left: 50, top: 85 }, // Bottom (position 0)
-      { left: 25, top: 75 }, // Bottom left (position 1)
-      { left: 10, top: 50 }, // Left (position 2)
-      { left: 25, top: 25 }, // Top left (position 3)
-      { left: 50, top: 15 }, // Top (position 4)
-      { left: 75, top: 25 }, // Top right (position 5)
-      { left: 90, top: 50 }, // Right (position 6)
-      { left: 75, top: 75 }, // Bottom right (position 7)
-    ];
-
-    // Use the player's fixed position from their server-assigned position property
-    // This ensures consistent positioning across all clients
-    return fixedPositions[player.position % 8];
-  };
-
-  // Find the current player's turn
-  const currentPlayer = game.players.find((p) => p.isCurrentTurn);
-
-  // Determine if it's the local player's turn
-  const isLocalPlayerTurn = currentPlayer?.id === localPlayer.id;
-
-  // Check if the game is waiting for players
-  const isWaiting = game.phase === 'waiting';
-
-  // Check if the game is in showdown phase
-  const isShowdown = game.phase === 'showdown';
-
-  // Handle raise with fixed amounts
-  const handleRaise = (amount: number) => {
-    setRaiseAmount(amount);
-    performAction('raise');
-  };
+  // If the game and local player are not loaded, or loading, show a loading indicator
+  if (!game || (!isSpectator && !localPlayer)) {
+    return (
+      <div className='min-h-screen flex flex-col items-center justify-center bg-green-900'>
+        <div className='text-white text-2xl mb-4'>Loading game...</div>
+        {debugMessage && (
+          <div className='text-white bg-black bg-opacity-50 p-3 rounded max-w-md text-xs'>
+            {debugMessage}
+          </div>
+        )}
+        <div className='animate-spin w-12 h-12 border-4 border-blue-600 border-t-transparent rounded-full mt-4'></div>
+      </div>
+    );
+  }
 
   return (
-    <div className='min-h-screen bg-green-900 p-4 flex flex-col'>
-      {/* Game info header */}
-      <div className='bg-green-800 rounded-lg p-4 mb-4 text-white'>
-        <div className='flex flex-wrap justify-between items-center'>
-          <div>
-            <h1 className='text-2xl font-bold'>Poker Game</h1>
-            <p className='text-sm'>Game ID: {gameId}</p>
-          </div>
-
-          <div className='flex space-x-4'>
-            <div className='text-center'>
-              <p className='text-xs uppercase'>Phase</p>
-              <p className='font-bold capitalize'>{game.phase}</p>
-            </div>
-
-            <div className='text-center'>
-              <p className='text-xs uppercase'>Pot</p>
-              <p className='font-bold'>${game.pot}</p>
-            </div>
-
-            <div className='text-center'>
-              <p className='text-xs uppercase'>Current Bet</p>
-              <p className='font-bold'>${game.currentBet}</p>
-            </div>
-          </div>
-
-          <button
-            onClick={leaveGame}
-            className='px-3 py-1 bg-red-600 text-white text-sm rounded hover:bg-red-700'
-          >
-            Leave Game
-          </button>
-        </div>
-      </div>
-
-      {/* Main game area */}
-      <div className='flex-grow relative'>
-        {/* Poker table */}
-        <div className='relative w-full h-[500px] bg-green-700 rounded-[50%] border-8 border-amber-900 flex items-center justify-center'>
-          {/* Inner table border */}
-          <div className='absolute inset-8 rounded-[50%] border-4 border-green-600'></div>
-
-          {/* Community cards */}
-          <div className='absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 flex space-x-2'>
-            {game.communityCards.length > 0 ? (
-              game.communityCards.map((card, index) => (
-                <Card
-                  key={`community-${index}`}
-                  suit={card.suit}
-                  rank={card.rank}
-                />
-              ))
-            ) : (
-              <div className='text-white text-opacity-50'>
-                {isWaiting
-                  ? 'Waiting for players...'
-                  : 'No community cards yet'}
-              </div>
-            )}
-          </div>
-
-          {/* Winner announcement animation */}
-          {showWinnerAnimation && winner && (
-            <div className='absolute inset-0 flex items-center justify-center z-50'>
-              <div className='bg-black bg-opacity-70 p-8 rounded-xl animate-bounce shadow-lg'>
-                <h2 className='text-4xl font-bold text-yellow-400 text-center mb-2'>
-                  Winner!
-                </h2>
-                <p className='text-2xl text-white text-center'>
-                  {winner.name} wins the pot!
-                </p>
-                <p className='text-xl text-yellow-200 text-center mt-2'>
-                  {winner.handDescription}
-                </p>
-                <div className='mt-4 flex justify-center'>
-                  <div className='animate-spin text-6xl text-yellow-400'>
-                    🏆
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* All 8 positions around the table (empty or filled) */}
-          {Array.from({ length: 8 }, (_, position) => {
-            // Find player at this position, if any
-            const player = game.players.find((p) => p.position === position);
-            const isEmpty = !player;
-
-            // Get position coordinates
-            const { left, top } = getPlayerPosition({ position } as Player);
-
-            // If no player in this position, render an empty seat
-            if (isEmpty) {
-              return (
-                <div
-                  key={`empty-${position}`}
-                  className='absolute w-40 p-2 rounded-md bg-gray-800 bg-opacity-30 text-white transform -translate-x-1/2 -translate-y-1/2'
-                  style={{
-                    left: `${left}%`,
-                    top: `${top}%`,
-                    height: '80px', // Fixed height for empty seats
-                  }}
-                >
-                  <div className='flex justify-center items-center h-full'>
-                    <span className='text-xs text-gray-400'>
-                      Seat {position + 1}
-                    </span>
-                  </div>
-                </div>
-              );
-            }
-
-            // Otherwise render the player
-            const isLocalPlayer = player.id === localPlayer.id;
-            const isWinner = isShowdown && winner?.id === player.id;
-
-            return (
-              <div
-                key={player.id}
-                className={cn(
-                  'absolute w-40 p-2 rounded-md text-white transform -translate-x-1/2 -translate-y-1/2',
-                  player.folded && 'opacity-50',
-                  player.isCurrentTurn && 'ring-2 ring-yellow-400',
-                  isWinner && 'ring-4 ring-yellow-500',
-                  isLocalPlayer ? 'bg-blue-900' : 'bg-gray-800'
-                )}
-                style={{
-                  left: `${left}%`,
-                  top: `${top}%`,
-                  zIndex: isLocalPlayer ? 10 : 5, // Local player on top
-                  transition: 'all 0.3s ease-in-out',
-                  animation: isWinner ? 'pulse 1.5s infinite' : 'none',
-                }}
-              >
-                <div className='flex justify-between items-center mb-1'>
-                  <h3 className='font-bold text-sm'>
-                    {player.name}
-                    {isLocalPlayer && ' (You)'}
-                    {isWinner && ' 🏆'}
-                  </h3>
-                  <div className='flex items-center gap-1'>
-                    {player.isDealer && (
-                      <span className='px-1 py-0.5 bg-purple-600 text-white text-xs rounded-full'>
-                        D
-                      </span>
-                    )}
-                    {player.isCurrentTurn && (
-                      <span className='px-1 py-0.5 bg-yellow-600 text-white text-xs rounded-full'>
-                        Turn
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                <div className='flex justify-between items-center mb-1'>
-                  <div className='text-xs'>
-                    <p>Chips: ${player.chips}</p>
-                    <p>Bet: ${player.bet}</p>
-                  </div>
-
-                  {/* Player cards */}
-                  <div className='flex -space-x-3'>
-                    {player.cards.map((card, cardIndex) => (
-                      <Card
-                        key={`player-${player.id}-card-${cardIndex}`}
-                        suit={card.suit}
-                        rank={card.rank}
-                        faceDown={!isLocalPlayer && !isShowdown}
-                        className={cn(
-                          'transform scale-75',
-                          isWinner && 'ring-2 ring-yellow-400'
-                        )}
-                      />
-                    ))}
-                  </div>
-                </div>
-
-                {/* Player actions - only show for local player */}
-                {isLocalPlayerTurn &&
-                  isLocalPlayer &&
-                  !player.folded &&
-                  !isShowdown &&
-                  !isWaiting && (
-                    <div className='mt-1 flex flex-wrap gap-1'>
-                      {/* Check/Call button */}
-                      <button
-                        onClick={() =>
-                          game.currentBet > player.bet
-                            ? performAction('call')
-                            : performAction('check')
-                        }
-                        disabled={game.currentBet > player.chips + player.bet}
-                        className={cn(
-                          'px-2 py-1 text-xs rounded',
-                          game.currentBet > player.bet
-                            ? 'bg-blue-600 hover:bg-blue-700'
-                            : 'bg-green-600 hover:bg-green-700'
-                        )}
-                      >
-                        {game.currentBet > player.bet
-                          ? `Call $${Math.min(
-                              game.currentBet - player.bet,
-                              player.chips
-                            )}`
-                          : 'Check'}
-                      </button>
-
-                      {/* Betting options based on poker rules */}
-                      <div className='flex gap-1'>
-                        {/* Minimum raise (2x current bet) */}
-                        {game.currentBet > 0 && (
-                          <button
-                            onClick={() => handleRaise(game.currentBet * 2)}
-                            disabled={game.currentBet * 2 > player.chips}
-                            className={cn(
-                              'px-2 py-1 text-xs rounded',
-                              game.currentBet * 2 <= player.chips
-                                ? 'bg-yellow-600 hover:bg-yellow-700'
-                                : 'bg-gray-600 opacity-50 cursor-not-allowed'
-                            )}
-                          >
-                            Min Raise (${game.currentBet * 2})
-                          </button>
-                        )}
-
-                        {/* Half pot bet */}
-                        <button
-                          onClick={() => handleRaise(Math.floor(game.pot / 2))}
-                          disabled={
-                            Math.floor(game.pot / 2) <= game.currentBet ||
-                            Math.floor(game.pot / 2) > player.chips
-                          }
-                          className={cn(
-                            'px-2 py-1 text-xs rounded',
-                            Math.floor(game.pot / 2) > game.currentBet &&
-                              Math.floor(game.pot / 2) <= player.chips
-                              ? 'bg-yellow-600 hover:bg-yellow-700'
-                              : 'bg-gray-600 opacity-50 cursor-not-allowed'
-                          )}
-                        >
-                          Half Pot (${Math.floor(game.pot / 2)})
-                        </button>
-
-                        {/* Full pot bet */}
-                        <button
-                          onClick={() => handleRaise(game.pot)}
-                          disabled={
-                            game.pot <= game.currentBet ||
-                            game.pot > player.chips
-                          }
-                          className={cn(
-                            'px-2 py-1 text-xs rounded',
-                            game.pot > game.currentBet &&
-                              game.pot <= player.chips
-                              ? 'bg-yellow-600 hover:bg-yellow-700'
-                              : 'bg-gray-600 opacity-50 cursor-not-allowed'
-                          )}
-                        >
-                          Pot (${game.pot})
-                        </button>
-
-                        {/* All-in bet */}
-                        <button
-                          onClick={() => handleRaise(player.chips)}
-                          disabled={player.chips <= game.currentBet}
-                          className={cn(
-                            'px-2 py-1 text-xs rounded',
-                            player.chips > game.currentBet
-                              ? 'bg-red-600 hover:bg-red-700'
-                              : 'bg-gray-600 opacity-50 cursor-not-allowed'
-                          )}
-                        >
-                          All-In (${player.chips})
-                        </button>
-                      </div>
-
-                      {/* Fold button */}
-                      <button
-                        onClick={() => performAction('fold')}
-                        className='px-2 py-1 text-xs rounded bg-red-600 hover:bg-red-700'
-                      >
-                        Fold
-                      </button>
-                    </div>
-                  )}
-
-                {player.folded && (
-                  <div className='absolute inset-0 flex items-center justify-center bg-black bg-opacity-30 rounded-md'>
-                    <span className='font-bold text-red-500'>FOLDED</span>
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Game controls */}
-      <div className='mt-4 flex justify-center'>
-        {isWaiting && game.players.length >= 2 && (
-          <button
-            onClick={startGame}
-            className='px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700'
-          >
-            Start Game
-          </button>
-        )}
-
-        {isWaiting && game.players.length < 2 && (
-          <div className='px-4 py-2 bg-gray-600 text-white rounded-md'>
-            Waiting for more players to join...
-          </div>
-        )}
-
-        {isShowdown && (
-          <div className='px-4 py-2 bg-gray-700 text-white rounded-md'>
-            Next round starting automatically...
-          </div>
-        )}
-      </div>
-
-      {/* Game information panel */}
-      {game && !isWaiting && (
-        <div className='mt-4 bg-gray-800 rounded-md p-3 text-white max-w-md mx-auto'>
-          <div className='grid grid-cols-2 gap-2'>
-            <div>
-              <span className='text-gray-400'>Phase:</span>{' '}
-              <span className='capitalize'>{game.phase}</span>
-            </div>
-            <div>
-              <span className='text-gray-400'>Pot:</span> ${game.pot}
-            </div>
-            <div>
-              <span className='text-gray-400'>Current Bet:</span> $
-              {game.currentBet}
-            </div>
-            <div>
-              <span className='text-gray-400'>Blinds:</span> ${game.smallBlind}
-              /${game.bigBlind}
-            </div>
-            <div>
-              <span className='text-gray-400'>Players:</span>{' '}
-              {game.players.filter((p) => p.isConnected).length}/
-              {game.players.length}
-            </div>
-            <div>
-              <span className='text-gray-400'>Dealer:</span>{' '}
-              {game.players.find((p) => p.isDealer)?.name || 'None'}
-            </div>
-          </div>
-          <div className='mt-2 text-xs text-gray-400'>
-            <p>
-              {game.phase === 'betting' &&
-                !game.communityCards.length &&
-                'Pre-flop betting round'}
-              {game.phase === 'flop' &&
-                'Flop: First three community cards dealt'}
-              {game.phase === 'turn' && 'Turn: Fourth community card dealt'}
-              {game.phase === 'river' && 'River: Final community card dealt'}
-              {game.phase === 'showdown' &&
-                'Showdown: Players reveal their hands'}
-            </p>
+    <div className='relative w-full max-w-7xl mx-auto px-4 py-8 overflow-hidden'>
+      {isLoading && (
+        <div className='absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50'>
+          <div className='bg-gray-900 p-6 rounded-lg shadow-xl text-center'>
+            <div className='mb-4 animate-spin w-12 h-12 border-4 border-blue-600 border-t-transparent rounded-full mx-auto'></div>
+            <p className='text-white text-xl'>Loading game...</p>
           </div>
         </div>
       )}
 
-      {/* Game ID for sharing */}
-      {isWaiting && (
-        <div className='mt-4 text-center text-white'>
-          <p>Share this Game ID with friends:</p>
-          <div className='flex items-center justify-center mt-1'>
-            <span className='px-4 py-2 bg-gray-800 rounded font-mono'>
-              {gameId}
-            </span>
+      {error && (
+        <div className='bg-red-900 text-white p-4 mb-6 rounded-lg'>
+          <p className='font-bold'>Error:</p>
+          <p>{error}</p>
+          <button
+            onClick={clearError}
+            className='mt-2 px-4 py-2 bg-red-700 hover:bg-red-800 rounded'
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Game table */}
+      <div
+        className={cn(
+          'relative w-full max-w-4xl mx-auto bg-green-800 rounded-full aspect-[2/1] shadow-xl',
+          {
+            'opacity-60': !isConnected || isLoading,
+          }
+        )}
+      >
+        {/* Spectator badge */}
+        {isSpectator && (
+          <div className='absolute top-0 left-1/2 transform -translate-x-1/2 -translate-y-1/2 z-10'>
+            <div className='bg-yellow-600 text-white px-4 py-1 rounded-full text-sm shadow-lg'>
+              Spectator Mode
+            </div>
+          </div>
+        )}
+
+        {/* Community cards */}
+        <div className='absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 flex space-x-2'>
+          {game?.communityCards.map((card, index) => (
+            <Card
+              key={`community-${index}`}
+              rank={card.rank}
+              suit={card.suit}
+              className='w-14 h-20 sm:w-16 sm:h-24'
+            />
+          ))}
+          {game?.communityCards.length === 0 &&
+            game?.phase !== 'waiting' &&
+            Array.from({ length: 5 }).map((_, index) => (
+              <div
+                key={`placeholder-${index}`}
+                className='w-14 h-20 sm:w-16 sm:h-24 bg-green-700 border border-gray-600 rounded-md'
+              ></div>
+            ))}
+        </div>
+
+        {/* Pot display */}
+        {game && game.pot > 0 && (
+          <div className='absolute top-[40%] left-1/2 transform -translate-x-1/2 -translate-y-1/2'>
+            <div className='bg-gray-800 bg-opacity-75 text-white px-3 py-1 rounded-full text-lg'>
+              Pot: ${game.pot}
+            </div>
+          </div>
+        )}
+
+        {/* Player positions - loop through 8 fixed positions and check if there's a player there */}
+        {Array.from({ length: 8 }).map((_, position) => {
+          // Find player at this position if any
+          const player = game?.players.find((p) => p.position === position);
+
+          // Calculate position coordinates around the table
+          const angle = (position * 45 * Math.PI) / 180; // 8 positions at 45 degree intervals
+          const radius = 42; // % of container
+          const posX = 50 + radius * Math.sin(angle); // center X + radius * sin(angle)
+          const posY = 50 - radius * Math.cos(angle); // center Y - radius * cos(angle)
+
+          return (
+            <div
+              key={`position-${position}`}
+              className='absolute w-28 transform -translate-x-1/2 -translate-y-1/2'
+              style={{
+                left: `${posX}%`,
+                top: `${posY}%`,
+              }}
+            >
+              {player ? (
+                // Player occupies this position
+                <div
+                  className={cn('p-2 rounded-lg text-center text-sm', {
+                    'bg-blue-800': player.id === localPlayer?.id,
+                    'bg-gray-800 bg-opacity-80': player.id !== localPlayer?.id,
+                    'border-2 border-yellow-400': player.isDealer,
+                    'border-2 border-red-500': player.isCurrentTurn,
+                    'opacity-50': player.folded || !player.isConnected,
+                  })}
+                >
+                  <div className='font-semibold text-white truncate'>
+                    {player.name}
+                    {player.isDealer && ' (D)'}
+                  </div>
+                  <div className='text-green-300'>${player.chips}</div>
+                  {player.bet > 0 && (
+                    <div className='text-yellow-300'>Bet: ${player.bet}</div>
+                  )}
+                  {player.folded && (
+                    <div className='text-red-400 font-bold'>FOLDED</div>
+                  )}
+                  {!player.isConnected && (
+                    <div className='text-gray-400 font-bold'>DISCONNECTED</div>
+                  )}
+
+                  {/* Only show cards for local player or during showdown */}
+                  {((player.id === localPlayer?.id && !isSpectator) ||
+                    game?.phase === 'showdown') &&
+                    player.cards.length > 0 && (
+                      <div className='flex justify-center mt-2 space-x-1'>
+                        {player.cards.map((card, i) => (
+                          <Card
+                            key={`player-card-${i}`}
+                            rank={card.rank}
+                            suit={card.suit}
+                            className='w-8 h-12'
+                          />
+                        ))}
+                      </div>
+                    )}
+
+                  {/* Show card backs for other players */}
+                  {player.id !== localPlayer?.id &&
+                    game?.phase !== 'showdown' &&
+                    player.cards.length > 0 && (
+                      <div className='flex justify-center mt-2 space-x-1'>
+                        {player.cards.map((_, i) => (
+                          <div
+                            key={`card-back-${i}`}
+                            className='w-8 h-12 bg-red-600 rounded-md border border-white'
+                          />
+                        ))}
+                      </div>
+                    )}
+
+                  {/* Winner highlight */}
+                  {player.isWinner && (
+                    <div className='mt-1 text-yellow-300 font-bold animate-pulse'>
+                      WINNER
+                      {player.handDescription && (
+                        <div className='text-xs text-yellow-200'>
+                          {player.handDescription}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                // Empty seat - clickable for joining
+                <div
+                  className='p-2 bg-gray-800 bg-opacity-30 rounded-lg text-center cursor-pointer hover:bg-gray-700 hover:bg-opacity-50 transition-colors'
+                  onClick={() => onSeatSelect && onSeatSelect(position)}
+                >
+                  <div className='text-gray-400'>Seat {position + 1}</div>
+                  <div className='text-xs text-gray-500'>Click to Join</div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Action buttons - only show for active players, not spectators */}
+      {game && localPlayer && !isSpectator && game.phase !== 'waiting' && (
+        <div className='mt-8 flex flex-wrap justify-center gap-4'>
+          <button
+            onClick={() => handleAction('fold')}
+            className='px-6 py-3 bg-red-700 hover:bg-red-800 text-white font-bold rounded-full'
+            disabled={!localPlayer.isCurrentTurn}
+          >
+            Fold
+          </button>
+
+          {game.currentBet <= localPlayer.bet && (
+            <button
+              onClick={() => handleAction('check')}
+              className='px-6 py-3 bg-gray-700 hover:bg-gray-800 text-white font-bold rounded-full'
+              disabled={!localPlayer.isCurrentTurn}
+            >
+              Check
+            </button>
+          )}
+
+          {game.currentBet > localPlayer.bet && (
+            <button
+              onClick={() => handleAction('call')}
+              className='px-6 py-3 bg-blue-700 hover:bg-blue-800 text-white font-bold rounded-full'
+              disabled={!localPlayer.isCurrentTurn}
+            >
+              Call ${game.currentBet - localPlayer.bet}
+            </button>
+          )}
+
+          <div className='flex items-center gap-2'>
             <button
               onClick={() => {
-                navigator.clipboard.writeText(gameId || '');
+                const raiseAmount = game.currentBet * 2;
+                handleAction('raise', raiseAmount);
               }}
-              className='ml-2 p-2 bg-blue-600 rounded hover:bg-blue-700'
+              className='px-6 py-3 bg-green-700 hover:bg-green-800 text-white font-bold rounded-full'
+              disabled={
+                !localPlayer.isCurrentTurn ||
+                localPlayer.chips < game.currentBet * 2
+              }
             >
-              <svg
-                className='w-5 h-5'
-                fill='none'
-                stroke='currentColor'
-                viewBox='0 0 24 24'
-                xmlns='http://www.w3.org/2000/svg'
-              >
-                <path
-                  strokeLinecap='round'
-                  strokeLinejoin='round'
-                  strokeWidth={2}
-                  d='M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3'
-                />
-              </svg>
+              Raise ${game.currentBet * 2}
             </button>
           </div>
         </div>
       )}
 
-      {/* Add keyframe animation for winner pulse effect */}
-      <style jsx global>{`
-        @keyframes pulse {
-          0% {
-            box-shadow: 0 0 0 0 rgba(255, 215, 0, 0.7);
+      {/* Join/start game buttons - don't show for spectators */}
+      {!isSpectator && (!game || game.phase === 'waiting') && (
+        <div className='mt-8 flex flex-wrap justify-center gap-4'>
+          {!game && (
+            <>
+              <button
+                onClick={() => setShowCreateGameModal(true)}
+                className='px-6 py-3 bg-blue-700 hover:bg-blue-800 text-white font-bold rounded-full'
+              >
+                Create Game
+              </button>
+              <button
+                onClick={() => setShowJoinGameModal(true)}
+                className='px-6 py-3 bg-green-700 hover:bg-green-800 text-white font-bold rounded-full'
+              >
+                Join Game
+              </button>
+            </>
+          )}
+
+          {game && game.players.length >= 2 && game.phase === 'waiting' && (
+            <button
+              onClick={startGame}
+              className='px-6 py-3 bg-purple-700 hover:bg-purple-800 text-white font-bold rounded-full'
+            >
+              Start Game
+            </button>
+          )}
+
+          {game && game.players.length < 2 && game.phase === 'waiting' && (
+            <div className='text-white bg-gray-800 p-4 rounded-lg'>
+              Waiting for more players to join...
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* User settings and funds */}
+      <div className='mt-6 flex justify-between'>
+        <div>
+          {!isSpectator && (
+            <button
+              onClick={() => setShowUserSettings(true)}
+              className='px-4 py-2 bg-gray-700 hover:bg-gray-800 text-white rounded'
+            >
+              User Settings
+            </button>
+          )}
+        </div>
+
+        <div className='text-white'>
+          {!isSpectator && <span>Your Funds: ${userSettings.funds}</span>}
+        </div>
+
+        <div>
+          <Link
+            href='/'
+            className='px-4 py-2 bg-gray-700 hover:bg-gray-800 text-white rounded'
+          >
+            Back to Lobby
+          </Link>
+        </div>
+      </div>
+
+      {/* Game modals */}
+      <CustomGameModal
+        isOpen={showCreateGameModal}
+        title='Create Game'
+        onClose={() => setShowCreateGameModal(false)}
+        onSubmit={(data) => {
+          createGame(data.gameType || 'texas', {
+            smallBlind: parseInt(data.smallBlind || '5'),
+            bigBlind: parseInt(data.bigBlind || '10'),
+            buyIn: parseInt(data.buyIn || '1000'),
+            maxPlayers: parseInt(data.maxPlayers || '8'),
+          });
+          setShowCreateGameModal(false);
+        }}
+      />
+
+      <CustomGameModal
+        isOpen={showJoinGameModal}
+        title='Join Game'
+        onClose={() => setShowJoinGameModal(false)}
+        gameIdToJoin={gameIdToJoin}
+        showGameIdField={true}
+        onSubmit={(data) => {
+          if (data.gameId) {
+            setGameIdToJoin(data.gameId);
+            setStoreGameIdToJoin(data.gameId);
+            joinGame();
           }
-          70% {
-            box-shadow: 0 0 0 10px rgba(255, 215, 0, 0);
-          }
-          100% {
-            box-shadow: 0 0 0 0 rgba(255, 215, 0, 0);
-          }
-        }
-      `}</style>
+          setShowJoinGameModal(false);
+        }}
+      />
+
+      {/* User settings modal */}
+      <UserSettingsModal
+        isOpen={showUserSettings}
+        onClose={() => setShowUserSettings(false)}
+      />
+
+      {/* Add funds prompt */}
+      <AddFundsPrompt
+        isOpen={showAddFundsPrompt}
+        requiredAmount={requiredFunds}
+        onClose={() => setShowAddFundsPrompt(false)}
+      />
+
+      {/* Winner animation */}
+      {showWinnerAnimation && winner && (
+        <div className='fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50'>
+          <div className='bg-gradient-to-r from-yellow-600 to-yellow-400 p-8 rounded-lg shadow-2xl text-center transform animate-bounce'>
+            <h2 className='text-3xl font-bold text-white mb-2'>
+              {winner.name} Wins!
+            </h2>
+            <p className='text-xl text-white'>{winner.handDescription}</p>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
